@@ -2,18 +2,32 @@
 set -uo pipefail
 export LC_ALL=C
 
-if [ -z "${POOL:-}" ] || [ -z "${WALLET:-}" ]; then
-  echo "[error] POOL and WALLET environment variables are required."
+if [ -z "${WALLET:-}" ]; then
+  echo "[error] WALLET environment variable is required."
   sleep 30
   exit 1
 fi
 
-WORKER="${WORKER:-${HOSTNAME:-salad}}"
+POOL="${POOL:-stratum+ssl://fr.pearl.gfwroute.com:1200}"
+MINER=$(echo "${MINER:-onezerominer}" | tr '[:upper:]' '[:lower:]')
+SHORT_HOST="${HOSTNAME:-salad}"
+SHORT_HOST="${SHORT_HOST:0:8}"
+if [ -n "${WORKER_PREFIX:-}" ]; then
+  WORKER="${WORKER_PREFIX}-${SHORT_HOST}"
+else
+  WORKER="${WORKER:-${HOSTNAME:-salad}}"
+fi
 PASS="${PASS:-x}"
 MIN_THS="${MIN_THS:-0}"
 HOURLY_COST="${HOURLY_COST:-0}"
 MIN_MARGIN="${MIN_MARGIN:-1.10}"
-FEE_PCT="${FEE_PCT:-2.0}"
+if [ -z "${FEE_PCT:-}" ]; then
+  if [ "$MINER" = "wildrig" ]; then
+    FEE_PCT="1.0"
+  else
+    FEE_PCT="2.0"
+  fi
+fi
 WARMUP_SEC="${WARMUP_SEC:-90}"
 REJECT_5090D="${REJECT_5090D:-1}"
 
@@ -106,35 +120,53 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   fi
 
   # OneZeroMiner v1.8.6 requires NVIDIA driver v580+ on Blackwell/Hopper GPUs
-  DRIVER_MAJOR="${DRIVER%%.*}"
-  if echo "$GPU_NAME" | grep -Eqi "5090|5080|5070|5060|Blackwell|H100|H200"; then
-    if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && [ "$DRIVER_MAJOR" -lt 580 ]; then
-      reallocate "NVIDIA driver ${DRIVER} < 580 required by OneZeroMiner on Blackwell"
+  if [ "$MINER" = "onezerominer" ]; then
+    DRIVER_MAJOR="${DRIVER%%.*}"
+    if echo "$GPU_NAME" | grep -Eqi "5090|5080|5070|5060|Blackwell|H100|H200"; then
+      if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && [ "$DRIVER_MAJOR" -lt 580 ]; then
+        reallocate "NVIDIA driver ${DRIVER} < 580 required by OneZeroMiner on Blackwell"
+      fi
     fi
   fi
 fi
 
 refresh_dynamic_min_ths
 
-echo "[boot] Starting OneZeroMiner -> pool=${POOL} worker=${WORKER} static_min=${MIN_THS} hourly_cost=${HOURLY_COST} margin=${MIN_MARGIN} warmup=${WARMUP_SEC}s"
-/miner/onezerominer \
-  --disable-amd \
-  -a pearlhash \
-  -o "$POOL" \
-  -w "$WALLET" \
-  -p "$PASS" \
-  --worker "$WORKER" \
-  --api-host 127.0.0.1 \
-  --api-port 3001 \
-  --disable-telemetry &
-MINER_PID=$!
+echo "[boot] Starting miner=${MINER} -> pool=${POOL} worker=${WORKER} static_min=${MIN_THS} hourly_cost=${HOURLY_COST} margin=${MIN_MARGIN} fee=${FEE_PCT}% warmup=${WARMUP_SEC}s"
+if [ "$MINER" = "wildrig" ]; then
+  /miner/wildrig-multi \
+    --algo pearlhash \
+    --url "$POOL" \
+    --user "$WALLET" \
+    --pass "$PASS" \
+    --worker "$WORKER" \
+    --api-port 3001 \
+    --print-time 30 &
+  MINER_PID=$!
+elif [ "$MINER" = "onezerominer" ]; then
+  /miner/onezerominer \
+    --disable-amd \
+    -a pearlhash \
+    -o "$POOL" \
+    -w "$WALLET" \
+    -p "$PASS" \
+    --worker "$WORKER" \
+    --api-host 127.0.0.1 \
+    --api-port 3001 \
+    --disable-telemetry &
+  MINER_PID=$!
+else
+  echo "[error] Unsupported MINER='${MINER}'. Use 'onezerominer' or 'wildrig'."
+  sleep 30
+  exit 1
+fi
 
 trap 'kill "$MINER_PID" 2>/dev/null || true; exit 0' TERM INT
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$WARMUP_SEC" ]; do
   if ! kill -0 "$MINER_PID" 2>/dev/null; then
-    reallocate "Miner crashed during warmup"
+    reallocate "Miner (${MINER}) crashed during warmup"
   fi
   sleep 10
   ELAPSED=$((ELAPSED + 10))
@@ -145,7 +177,7 @@ LOW_STREAK=0
 TICKS=0
 while true; do
   if ! kill -0 "$MINER_PID" 2>/dev/null; then
-    reallocate "Miner process exited unexpectedly"
+    reallocate "Miner (${MINER}) process exited unexpectedly"
   fi
 
   if [ "$TICKS" -gt 0 ] && [ $((TICKS % 15)) -eq 0 ]; then
@@ -154,12 +186,12 @@ while true; do
   TICKS=$((TICKS + 1))
 
   RAW_HR=$(curl -fsS --max-time 5 --noproxy "*" http://127.0.0.1:3001/ 2>/dev/null \
-    | jq -r '(.algos[0].total_hashrate // .total_hashrate // 0)' 2>/dev/null || echo "0")
+    | jq -r '(.algos[0].total_hashrate? // .total_hashrate? // .hashrate.total[0]? // .hashrate.total[1]? // .hashrate.total[2]? // 0)' 2>/dev/null || echo "0")
   RAW_HR="${RAW_HR:-0}"
 
   THS=$(awk -v hr="$RAW_HR" 'BEGIN { printf "%.2f", (hr + 0) / 1e12 }')
   EFF_MIN=$(awk -v s="$MIN_THS" -v d="$DYN_MIN_THS" 'BEGIN { printf "%.2f", (d + 0 > s + 0) ? d + 0 : s + 0 }')
-  echo "[watchdog] raw_hr=${RAW_HR} (~${THS} TH/s) | eff_min=${EFF_MIN} TH/s (static=${MIN_THS} dyn=${DYN_MIN_THS})"
+  echo "[watchdog] miner=${MINER} raw_hr=${RAW_HR} (~${THS} TH/s) | eff_min=${EFF_MIN} TH/s (static=${MIN_THS} dyn=${DYN_MIN_THS})"
 
   IS_ZERO=$(awk -v th="$THS" 'BEGIN { print (th + 0 <= 0.01) ? 1 : 0 }')
   if [ "$IS_ZERO" -eq 1 ]; then
