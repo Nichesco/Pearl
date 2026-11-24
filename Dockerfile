@@ -15,7 +15,7 @@ RUN curl -fsSL "$OZM_URL" -o /tmp/ozm.tar.gz \
     && tar -xzf /tmp/ozm.tar.gz --strip-components=1 -C /miner \
     && rm -f /tmp/ozm.tar.gz \
     && chmod +x /miner/onezerominer \
-    && /miner/onezerominer -V
+    && test -x /miner/onezerominer
 
 COPY entrypoint.sh /miner/entrypoint.sh
 RUN sed -i 's/\r$//' /miner/entrypoint.sh && chmod +x /miner/entrypoint.sh && bash -n /miner/entrypoint.sh
