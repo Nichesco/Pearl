@@ -121,6 +121,11 @@ def plan_rollout(groups, target_image):
     return updates
 
 
+def rollout_patch_accepted(resp, target_image):
+    got_image = ((resp or {}).get("container") or {}).get("image")
+    return got_image == target_image or bool((resp or {}).get("pending_change"))
+
+
 def plan_actions(groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, start_roi_pct, stop_roi_pct, default_fee_pct):
     """Pure decision planner budgeting by live running/creating GPU spend."""
     class_by_id = {c["id"]: c for c in gpu_classes}
@@ -269,9 +274,11 @@ def run_rollout(target_image, api_key, org, project):
         try:
             resp = http_json(url, method="PATCH", headers=headers, payload={"container": {"image": target_image}})
             got_image = ((resp or {}).get("container") or {}).get("image")
-            if got_image != target_image:
-                raise RuntimeError(f"PATCH returned image '{got_image}' != '{target_image}'")
-            print(f"[ok] rollout {name}: {old_img} -> {target_image}")
+            pending = bool((resp or {}).get("pending_change"))
+            if not rollout_patch_accepted(resp, target_image):
+                raise RuntimeError(f"PATCH returned image '{got_image}' != '{target_image}' (pending_change={pending})")
+            suffix = " (pending)" if pending and got_image != target_image else ""
+            print(f"[ok] rollout {name}: {old_img} -> {target_image}{suffix}")
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:200]
             print(f"[err] rollout {name} -> HTTP {e.code}: {detail}")
@@ -361,6 +368,9 @@ def run_self_test():
     roll = [n for n, _ in plan_rollout(groups, "ghcr.io/nichesco/pearl:new")]
     assert "4070-idle" not in roll and "non-miner" not in roll, roll
     assert "4090-idle" in roll and "5090-run2" in roll, roll
+    assert rollout_patch_accepted({"container": {"image": "img:new"}, "pending_change": False}, "img:new")
+    assert rollout_patch_accepted({"container": {"image": "img:old"}, "pending_change": True}, "img:new")
+    assert not rollout_patch_accepted({"container": {"image": "img:old"}, "pending_change": False}, "img:new")
 
     price, psrc = fetch_pearl_price_usd()
     net_h, rw, bt, nsrc = fetch_pearl_network()
