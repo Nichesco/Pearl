@@ -10,10 +10,8 @@ fi
 
 POOL="${POOL:-stratum+ssl://fr.pearl.gfwroute.com:1200}"
 MINER=$(echo "${MINER:-onezerominer}" | tr '[:upper:]' '[:lower:]')
-SHORT_HOST="${HOSTNAME:-salad}"
-SHORT_HOST="${SHORT_HOST:0:8}"
 if [ -n "${WORKER_PREFIX:-}" ]; then
-  WORKER="${WORKER_PREFIX}-${SHORT_HOST}"
+  WORKER="${WORKER_PREFIX}"
 else
   WORKER="${WORKER:-${HOSTNAME:-salad}}"
 fi
