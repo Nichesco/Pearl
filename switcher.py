@@ -38,10 +38,19 @@ GPU_BENCHMARKS_THS = [
     ("RTX 3070 Ti", 75.4),
     ("RTX 3070", 72.0),
     ("RTX 4060 Ti", 92.5),
+    ("RTX 5060 Ti", 89.0),
+    ("RTX 5060 Laptop", None),
+    ("RTX 5060", 74.0),
+    ("RTX 4060 Laptop", None),
+    ("RTX 4060", 65.2),
     ("RTX 3060 Ti", 59.6),
+    ("RTX 3060 Laptop", None),
+    ("RTX 3060", 49.0),
     ("RTX 2080 Ti", 92.3),
+    ("RTX 2080", 67.6),
     ("RTX 2070", 52.9),
     ("RTX 2060", 41.3),
+    ("Stable Diffusion Compatible", 60.0),
 ]
 
 ACTIVE_STATUSES = {"running", "deploying", "pending"}
@@ -126,9 +135,62 @@ def rollout_patch_accepted(resp, target_image):
     return got_image == target_image or bool((resp or {}).get("pending_change"))
 
 
-def plan_actions(groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, start_roi_pct, stop_roi_pct, default_fee_pct):
+def fetch_gpu_availability(groups, api_key, org):
+    """Fetch live SaladCloud GPU availability per group priority; returns {} or {name: int|None}."""
+    if not api_key:
+        return {}
+    headers = {"Salad-Api-Key": api_key}
+    avail_url = f"{SALAD_API}/organizations/{org}/availability/sce-gpu-availability"
+    cache = {}
+    out = {}
+    for g in groups:
+        name = g.get("name", "?")
+        container = g.get("container") or {}
+        env = container.get("environment_variables") or {}
+        if not env.get("POOL") or not env.get("WALLET"):
+            continue
+        res = container.get("resources") or {}
+        gpu_ids = res.get("gpu_classes") or []
+        if len(gpu_ids) != 1:
+            continue
+        cpu = int(res.get("cpu") or 1)
+        mem = int(res.get("memory") or 2048)
+        key = (gpu_ids[0], cpu, mem)
+        if key not in cache:
+            try:
+                cache[key] = http_json(
+                    avail_url,
+                    method="POST",
+                    headers=headers,
+                    payload={"gpu_classes": [gpu_ids[0]], "cpu": cpu, "memory": mem, "storage_amount": 1073741824},
+                )
+            except Exception:
+                cache[key] = None
+            time.sleep(0.05)
+        data = cache[key]
+        prio = (g.get("priority") or "batch").lower()
+        val = data.get(f"available_gpu_{prio}") if isinstance(data, dict) else None
+        out[name] = int(val) if val is not None else None
+    return out
+
+
+def plan_actions(
+    groups,
+    gpu_classes,
+    usd_per_100th_hr_gross,
+    max_daily_usd,
+    start_roi_pct,
+    stop_roi_pct,
+    default_fee_pct,
+    low_start_roi_pct=None,
+    low_stop_roi_pct=None,
+    avail_by_group=None,
+):
     """Pure decision planner budgeting by live running/creating GPU spend."""
     class_by_id = {c["id"]: c for c in gpu_classes}
+    low_start = start_roi_pct if low_start_roi_pct is None else low_start_roi_pct
+    low_stop = stop_roi_pct if low_stop_roi_pct is None else low_stop_roi_pct
+    avail_map = avail_by_group or {}
     candidates = []
     skipped = []
 
@@ -194,6 +256,7 @@ def plan_actions(groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, sta
             "name": name,
             "gpu": gpu_name,
             "priority": priority,
+            "avail": avail_map.get(name),
             "replicas": replicas,
             "running_now": running_now,
             "status": status,
@@ -217,14 +280,15 @@ def plan_actions(groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, sta
 
     planned_daily_spend = 0.0
     for c in candidates:
-        min_needed_roi = stop_roi_pct if c["is_active"] else start_roi_pct
+        grp_start, grp_stop = (start_roi_pct, stop_roi_pct) if c["priority"] == "batch" else (low_start, low_stop)
+        min_needed_roi = grp_stop if c["is_active"] else grp_start
         if c["roi_pct"] < min_needed_roi:
             if c["is_active"]:
                 c["action"] = "STOP"
-                c["reason"] = f"ROI {c['roi_pct']:+.1f}% < stop floor {stop_roi_pct:.1f}%"
+                c["reason"] = f"ROI {c['roi_pct']:+.1f}% < stop floor {grp_stop:.1f}%"
             else:
                 c["action"] = "KEEP_STOPPED"
-                c["reason"] = f"ROI {c['roi_pct']:+.1f}% < start floor {start_roi_pct:.1f}%"
+                c["reason"] = f"ROI {c['roi_pct']:+.1f}% < start floor {grp_start:.1f}%"
             continue
 
         if c["is_active"]:
@@ -243,6 +307,10 @@ def plan_actions(groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, sta
                 c["action"] = "STOP"
                 c["reason"] = f"over ${max_daily_usd:.2f}/day live cap (higher-ROI groups take priority)"
         else:
+            if c["priority"] != "batch" and c["avail"] == 0:
+                c["action"] = "KEEP_STOPPED"
+                c["reason"] = f"0 live GPUs available on {c['priority']}"
+                continue
             if planned_daily_spend + c["start_budget_cost"] <= max_daily_usd + 1e-6 and (
                 c["start_budget_cost"] > 0 or planned_daily_spend < max_daily_usd - 1e-6
             ):
@@ -294,9 +362,20 @@ def run_rollout(target_image, api_key, org, project):
 
 def run_self_test():
     # 1. Verify benchmark coverage and laptop exclusions
-    for model in ("RTX 4070", "RTX 3070", "RTX 3060 Ti", "RTX 3080", "RTX 2070", "RTX 4070 Ti", "RTX 4070 Ti Super", "RTX 3080 Ti"):
+    for model in (
+        "RTX 4070", "RTX 3070", "RTX 3060 Ti", "RTX 3080", "RTX 2070",
+        "RTX 4070 Ti", "RTX 4070 Ti Super", "RTX 3080 Ti",
+        "RTX 5060 Ti", "RTX 5060", "RTX 4060", "RTX 3060", "RTX 2080",
+        "Stable Diffusion Compatible",
+    ):
         assert match_gpu_ths(f"{model} (12 GB)") is not None, model
-    for laptop in ("RTX 4090 Laptop (16 GB)", "RTX 5090 Laptop (24 GB)", "RTX 5080 Laptop (16 GB)"):
+    assert match_gpu_ths("RTX 3060 Ti (8 GB)") > match_gpu_ths("RTX 3060 (8 GB)")
+    assert match_gpu_ths("RTX 4060 Ti (8 GB)") > match_gpu_ths("RTX 4060 (8 GB)")
+    assert match_gpu_ths("RTX 2080 Ti (11 GB)") > match_gpu_ths("RTX 2080 (8 GB)")
+    for laptop in (
+        "RTX 4090 Laptop (16 GB)", "RTX 5090 Laptop (24 GB)", "RTX 5080 Laptop (16 GB)",
+        "RTX 5060 Laptop (8 GB)", "RTX 4060 Laptop (8 GB)", "RTX 3060 Laptop (6 GB)",
+    ):
         assert match_gpu_ths(laptop) is None, laptop
 
     gpu_classes = [
@@ -372,6 +451,40 @@ def run_self_test():
     assert rollout_patch_accepted({"container": {"image": "img:old"}, "pending_change": True}, "img:new")
     assert not rollout_patch_accepted({"container": {"image": "img:old"}, "pending_change": False}, "img:new")
 
+    # 5. Low-tier thresholds (+2% start / <0% stop) + availability gating (0-avail low skipped, 0-avail batch queued)
+    mixed = [
+        {"name": "4090-low-zero", "priority": "low", "replicas": 3,
+         "current_state": {"status": "stopped"},
+         "container": {"resources": {"gpu_classes": ["g4090"]}, "environment_variables": env_ok}},
+        {"name": "4070-low-avail", "priority": "low", "replicas": 2,
+         "current_state": {"status": "stopped"},
+         "container": {"resources": {"gpu_classes": ["g4070"]}, "environment_variables": env_ok}},
+        {"name": "5090-low-neg", "priority": "low", "replicas": 1,
+         "current_state": {"status": "running", "instance_status_counts": {"running_count": 1}},
+         "container": {"resources": {"gpu_classes": ["g5090"]}, "environment_variables": env_ok}},
+        {"name": "5070ti-batch-zero", "priority": "batch", "replicas": 2,
+         "current_state": {"status": "stopped"},
+         "container": {"resources": {"gpu_classes": ["g5070ti"]}, "environment_variables": env_ok}},
+    ]
+    # Note: g4070 low price from fixture prices above needs low tier; add it locally for test
+    gpu_classes_ext = list(gpu_classes) + [
+        {"id": "g4070low", "name": "RTX 4070 (12 GB)", "prices": [{"priority": "low", "price": "0.102"}]},
+        {"id": "g5090low", "name": "RTX 5090 (32 GB)", "prices": [{"priority": "low", "price": "0.367"}]},
+    ]
+    mixed[1]["container"]["resources"]["gpu_classes"] = ["g4070low"]
+    mixed[2]["container"]["resources"]["gpu_classes"] = ["g5090low"]
+    avail = {"4090-low-zero": 0, "4070-low-avail": 5, "5090-low-neg": 10, "5070ti-batch-zero": 0}
+    cands_mix, _, spend_mix = plan_actions(
+        mixed, gpu_classes_ext, 0.084, 20.0, 15.0, 10.0, 2.0,
+        low_start_roi_pct=2.0, low_stop_roi_pct=0.0, avail_by_group=avail,
+    )
+    by_mix = {c["name"]: c["action"] for c in cands_mix}
+    assert by_mix["4090-low-zero"] == "KEEP_STOPPED", by_mix
+    assert by_mix["4070-low-avail"] == "START", by_mix
+    assert by_mix["5090-low-neg"] == "STOP", by_mix
+    assert by_mix["5070ti-batch-zero"] == "START", by_mix
+    assert abs(spend_mix - (0.102 * 24.0 * 2)) < 0.01, spend_mix
+
     price, psrc = fetch_pearl_price_usd()
     net_h, rw, bt, nsrc = fetch_pearl_network()
     print(f"SELF-TEST PASSED | Live check: PEARL=${price:.4f} ({psrc}), net={net_h/1e18:.2f} EH/s ({nsrc})")
@@ -401,6 +514,8 @@ def main():
     max_daily_usd = float(os.environ.get("MAX_DAILY_USD", "20.0"))
     start_roi_pct = float(os.environ.get("START_ROI_PCT", "15.0"))
     stop_roi_pct = float(os.environ.get("STOP_ROI_PCT", "10.0"))
+    low_start_roi_pct = float(os.environ.get("LOW_START_ROI_PCT", "2.0"))
+    low_stop_roi_pct = float(os.environ.get("LOW_STOP_ROI_PCT", "0.0"))
     default_fee_pct = float(os.environ.get("FEE_PCT", "2.0"))
     dry_run = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 
@@ -412,14 +527,28 @@ def main():
     print(f"=== Pearl SaladCloud Switcher ({'DRY-RUN' if dry_run else 'LIVE'}) ===")
     print(f"Org/Project : {org}/{project}")
     print(f"Market      : PEARL=${price:.4f} ({psrc}) | Net={net_h/1e18:.2f} EH/s ({nsrc}) | Gross=${usd_per_100th_hr_gross:.4f}/hr per 100 TH/s")
-    print(f"Rules       : MAX_DAILY_USD=${max_daily_usd:.2f} | START_ROI>={start_roi_pct:.1f}% | STOP_ROI<{stop_roi_pct:.1f}% | FEE={default_fee_pct:.1f}%\n")
+    print(
+        f"Rules       : MAX_DAILY_USD=${max_daily_usd:.2f} | "
+        f"BATCH>={start_roi_pct:.1f}%/<{stop_roi_pct:.1f}% | "
+        f"LOW>={low_start_roi_pct:.1f}%/<{low_stop_roi_pct:.1f}% | FEE={default_fee_pct:.1f}%\n"
+    )
 
     headers = {"Salad-Api-Key": api_key}
     gpu_classes = (http_json(f"{SALAD_API}/organizations/{org}/gpu-classes", headers=headers) or {}).get("items", [])
     groups = (http_json(f"{SALAD_API}/organizations/{org}/projects/{project}/containers", headers=headers) or {}).get("items", [])
+    avail_by_group = fetch_gpu_availability(groups, api_key, org)
 
     candidates, skipped, planned_daily = plan_actions(
-        groups, gpu_classes, usd_per_100th_hr_gross, max_daily_usd, start_roi_pct, stop_roi_pct, default_fee_pct
+        groups,
+        gpu_classes,
+        usd_per_100th_hr_gross,
+        max_daily_usd,
+        start_roi_pct,
+        stop_roi_pct,
+        default_fee_pct,
+        low_start_roi_pct=low_start_roi_pct,
+        low_stop_roi_pct=low_stop_roi_pct,
+        avail_by_group=avail_by_group,
     )
 
     for name, reason in skipped:
@@ -427,15 +556,16 @@ def main():
     if skipped:
         print()
 
-    print(f"{'Group':<28} {'GPU':<20} {'Prio':<6} {'Run/Rep':>7} {'Status':<10} {'Live$/d':>7} {'ROI':>8}  Action")
-    print("-" * 112)
+    print(f"{'Group':<28} {'GPU':<22} {'Prio':<6} {'Avl':>4} {'Run/Rep':>7} {'Status':<10} {'Live$/d':>7} {'ROI':>8}  Action")
+    print("-" * 120)
     for c in candidates:
         label = c["action"]
         if dry_run and label in ("START", "STOP"):
             label = f"WOULD_{label}"
         run_rep = f"{c['running_now']}/{c['replicas']}"
+        avl = str(c["avail"]) if c["avail"] is not None else "?"
         print(
-            f"{c['name']:<28} {c['gpu'][:20]:<20} {c['priority']:<6} {run_rep:>7} "
+            f"{c['name']:<28} {c['gpu'][:22]:<22} {c['priority']:<6} {avl:>4} {run_rep:>7} "
             f"{c['status']:<10} ${c['live_daily_cost']:>6.2f} {c['roi_pct']:>+7.1f}%  {label} ({c['reason']})"
         )
 
@@ -447,23 +577,39 @@ def main():
 
     for c in candidates:
         if c["action"] in ("KEEP_RUNNING", "START"):
+            merged_env = dict(c["env"])
+            changes = []
+
             raw_hc = c["env"].get("HOURLY_COST", "")
             try:
-                cur_hc = float(raw_hc)
-                drifted = abs(cur_hc - c["hourly_cost"]) > 0.001
+                hc_drifted = abs(float(raw_hc) - c["hourly_cost"]) > 0.001
             except (TypeError, ValueError):
-                drifted = True
-            if drifted:
+                hc_drifted = True
+            if hc_drifted:
                 new_hc = f"{c['hourly_cost']:.3f}".rstrip("0").rstrip(".")
-                merged_env = dict(c["env"])
                 merged_env["HOURLY_COST"] = new_hc
+                changes.append(f"HOURLY_COST '{raw_hc}'->'{new_hc}'")
+
+            if c["priority"] != "batch":
+                target_mm = max(0.85, round(1.0 + (low_stop_roi_pct - 2.0) / 100.0, 2))
+                raw_mm = c["env"].get("MIN_MARGIN", "")
+                try:
+                    mm_drifted = abs(float(raw_mm) - target_mm) > 0.005
+                except (TypeError, ValueError):
+                    mm_drifted = True
+                if mm_drifted:
+                    new_mm = f"{target_mm:.2f}"
+                    merged_env["MIN_MARGIN"] = new_mm
+                    changes.append(f"MIN_MARGIN '{raw_mm}'->'{new_mm}'")
+
+            if changes:
                 url = f"{SALAD_API}/organizations/{org}/projects/{project}/containers/{c['name']}"
                 try:
                     http_json(url, method="PATCH", headers=headers, payload={"container": {"environment_variables": merged_env}})
-                    print(f"[ok] sync HOURLY_COST {c['name']}: '{raw_hc}' -> '{new_hc}'")
+                    print(f"[ok] sync env {c['name']}: {', '.join(changes)}")
                 except urllib.error.HTTPError as e:
                     detail = e.read().decode("utf-8", errors="replace")[:200]
-                    print(f"[err] sync HOURLY_COST {c['name']} -> HTTP {e.code}: {detail}")
+                    print(f"[err] sync env {c['name']} -> HTTP {e.code}: {detail}")
                 time.sleep(0.25)
 
         if c["action"] not in ("START", "STOP"):
