@@ -35,7 +35,7 @@ jobs:
           SALAD_PROJECT: ${{ vars.SALAD_PROJECT || 'pearl-test-4090' }}
           MAX_DAILY_USD: ${{ vars.MAX_DAILY_USD || '20' }}
           START_ROI_PCT: ${{ vars.START_ROI_PCT || '15' }}
-          STOP_ROI_PCT: ${{ vars.STOP_ROI_PCT || '5' }}
+          STOP_ROI_PCT: ${{ vars.STOP_ROI_PCT || '10' }}
           FEE_PCT: ${{ vars.FEE_PCT || '2.0' }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.DRY_RUN || 'true' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.DRY_RUN || 'false' }}
         run: python3 switcher.py

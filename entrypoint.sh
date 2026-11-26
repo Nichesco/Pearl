@@ -28,7 +28,7 @@ if [ -z "${FEE_PCT:-}" ]; then
     FEE_PCT="2.0"
   fi
 fi
-WARMUP_SEC="${WARMUP_SEC:-90}"
+WARMUP_SEC="${WARMUP_SEC:-150}"
 REJECT_5090D="${REJECT_5090D:-1}"
 
 DYN_MIN_THS="0"
@@ -180,7 +180,8 @@ while true; do
     reallocate "Miner (${MINER}) process exited unexpectedly"
   fi
 
-  if [ "$TICKS" -gt 0 ] && [ $((TICKS % 15)) -eq 0 ]; then
+  NEED_PRICE_RETRY=$(awk -v c="$HOURLY_COST" -v d="$DYN_MIN_THS" 'BEGIN { print (c + 0 > 0 && d + 0 <= 0) ? 1 : 0 }')
+  if [ "$NEED_PRICE_RETRY" -eq 1 ] || { [ "$TICKS" -gt 0 ] && [ $((TICKS % 15)) -eq 0 ]; }; then
     refresh_dynamic_min_ths
   fi
   TICKS=$((TICKS + 1))

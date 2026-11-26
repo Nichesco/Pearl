@@ -24,6 +24,8 @@ jobs:
         run: |
           repo=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
           sha=$(echo '${{ github.sha }}' | cut -c1-7)
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "tags=ghcr.io/${repo}:latest,ghcr.io/${repo}:${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
@@ -40,3 +42,10 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+
+      - name: Auto-rollout image to SaladCloud
+        env:
+          SALAD_API_KEY: ${{ secrets.SALAD_API_KEY }}
+          SALAD_ORG: ${{ vars.SALAD_ORG || 'pearl123s' }}
+          SALAD_PROJECT: ${{ vars.SALAD_PROJECT || 'pearl-test-4090' }}
+        run: python3 switcher.py --rollout-image "ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.sha }}"
