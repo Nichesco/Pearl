@@ -53,6 +53,15 @@ GPU_BENCHMARKS_THS = [
     ("Stable Diffusion Compatible", 60.0),
 ]
 
+NEB_BENCHMARKS_GHS = [
+    ("RTX 5090 Laptop", None),
+    ("RTX 5090", 1.72),
+    ("RTX 4090 Laptop", None),
+    ("RTX 4090", 1.25),
+    ("RTX 5070 Ti Laptop", None),
+    ("RTX 5070 Ti", 0.59),
+]
+
 ACTIVE_STATUSES = {"running", "deploying", "pending"}
 
 
@@ -116,6 +125,46 @@ def match_gpu_ths(gpu_name):
     return None
 
 
+def match_neb_ghs(gpu_name):
+    low = (gpu_name or "").lower()
+    for pattern, ghs in NEB_BENCHMARKS_GHS:
+        if pattern.lower() in low:
+            return ghs
+    return None
+
+
+def group_coin(env):
+    if env.get("POOL") and env.get("WALLET"):
+        return "PRL"
+    if (env.get("COIN") or "").upper() == "NEB" and env.get("USERNAME"):
+        return "NEB"
+    return None
+
+
+def fetch_neb_usd_per_gh_hr_gross():
+    d = http_json("https://api.coingecko.com/api/v3/simple/price?ids=neural-engine-byte&vs_currencies=usd", timeout=8)
+    price = float(d["neural-engine-byte"]["usd"])
+    if not (0.0001 < price < 10000):
+        raise RuntimeError(f"Unexpected NEB price: {price}")
+    try:
+        s = http_json("https://neb.suprnova.cc/api/pools/neb", timeout=8)
+        net_gh = float(s["pool"]["networkStats"]["networkHashrate"]) / 1e9
+        if net_gh > 10:
+            # shortcut: Suprnova omits blockTime/reward, assumes 60s target and 19 NEB reward; update on halving
+            return (1.0 / net_gh) * 60.0 * 19.0 * price, price, net_gh, "Suprnova"
+    except Exception:
+        pass
+    m2 = http_json("https://neb.2miners.com/api/stats", timeout=8)
+    nodes = m2.get("nodes")
+    node = nodes[0] if isinstance(nodes, list) else nodes
+    net_gh = float(node["networkhashps"]) / 1e9
+    bt = float(node["avgBlockTime"])
+    rw = float(node["blockReward"]) / 1e8
+    if net_gh > 10 and bt > 0 and rw > 0:
+        return (1.0 / net_gh) * (3600.0 / bt) * rw * price, price, net_gh, "2Miners"
+    raise RuntimeError("Failed to fetch live NEB network stats from all sources")
+
+
 def plan_rollout(groups, target_image):
     """Return list of (group_name, old_image) for Pearl miner groups needing an image update."""
     updates = []
@@ -147,7 +196,7 @@ def fetch_gpu_availability(groups, api_key, org):
         name = g.get("name", "?")
         container = g.get("container") or {}
         env = container.get("environment_variables") or {}
-        if not env.get("POOL") or not env.get("WALLET"):
+        if not group_coin(env):
             continue
         res = container.get("resources") or {}
         gpu_ids = res.get("gpu_classes") or []
@@ -185,6 +234,7 @@ def plan_actions(
     low_start_roi_pct=None,
     low_stop_roi_pct=None,
     avail_by_group=None,
+    neb_usd_per_gh_hr_gross=None,
 ):
     """Pure decision planner budgeting by live running/creating GPU spend."""
     class_by_id = {c["id"]: c for c in gpu_classes}
@@ -198,8 +248,9 @@ def plan_actions(
         name = g.get("name", "?")
         container = g.get("container") or {}
         env = container.get("environment_variables") or {}
-        if not env.get("POOL") or not env.get("WALLET"):
-            skipped.append((name, "not a Pearl miner group (missing POOL/WALLET)"))
+        coin = group_coin(env)
+        if not coin:
+            skipped.append((name, "not a managed miner group (missing POOL/WALLET or COIN=NEB)"))
             continue
 
         gpu_ids = (container.get("resources") or {}).get("gpu_classes") or []
@@ -213,10 +264,19 @@ def plan_actions(
             continue
 
         gpu_name = gclass.get("name", "?")
-        est_ths = match_gpu_ths(gpu_name)
-        if est_ths is None:
-            skipped.append((name, f"no TH/s benchmark for '{gpu_name}'"))
-            continue
+        if coin == "PRL":
+            est_rate = match_gpu_ths(gpu_name)
+            if est_rate is None:
+                skipped.append((name, f"no TH/s benchmark for '{gpu_name}'"))
+                continue
+        else:
+            if neb_usd_per_gh_hr_gross is None:
+                skipped.append((name, "NEB market stats unavailable"))
+                continue
+            est_rate = match_neb_ghs(gpu_name)
+            if est_rate is None:
+                skipped.append((name, f"no NEB GH/s benchmark for '{gpu_name}'"))
+                continue
 
         priority = (g.get("priority") or "batch").lower()
         hourly_cost = None
@@ -233,10 +293,11 @@ def plan_actions(
             skipped.append((name, f"could not determine hourly price for {gpu_name} ({priority})"))
             continue
 
+        base_fee = default_fee_pct if coin == "PRL" else 1.0
         try:
-            fee_pct = float(env.get("FEE_PCT", default_fee_pct))
+            fee_pct = float(env.get("FEE_PCT", base_fee))
         except ValueError:
-            fee_pct = default_fee_pct
+            fee_pct = base_fee
 
         replicas = max(1, int(g.get("replicas") or 1))
         state = g.get("current_state") or {}
@@ -248,12 +309,16 @@ def plan_actions(
         max_daily_cost = hourly_cost * 24.0 * replicas
         start_budget_cost = 0.0 if priority == "batch" else max_daily_cost
 
-        rev_hr = (est_ths / 100.0) * usd_per_100th_hr_gross * (1.0 - fee_pct / 100.0)
+        if coin == "PRL":
+            rev_hr = (est_rate / 100.0) * usd_per_100th_hr_gross * (1.0 - fee_pct / 100.0)
+        else:
+            rev_hr = est_rate * neb_usd_per_gh_hr_gross * (1.0 - fee_pct / 100.0)
         roi_pct = ((rev_hr - hourly_cost) / hourly_cost) * 100.0
         daily_profit = (rev_hr - hourly_cost) * 24.0 * running_now
 
         candidates.append({
             "name": name,
+            "coin": coin,
             "gpu": gpu_name,
             "priority": priority,
             "avail": avail_map.get(name),
@@ -266,7 +331,7 @@ def plan_actions(
             "max_daily_cost": max_daily_cost,
             "start_budget_cost": start_budget_cost,
             "env": env,
-            "est_ths": est_ths,
+            "est_ths": est_rate,
             "roi_pct": roi_pct,
             "daily_profit": daily_profit,
             "action": "KEEP_STOPPED",
@@ -485,6 +550,20 @@ def run_self_test():
     assert by_mix["5070ti-batch-zero"] == "START", by_mix
     assert abs(spend_mix - (0.102 * 24.0 * 2)) < 0.01, spend_mix
 
+    # 6. NEB group ROI start/stop & rollout exclusion
+    neb_env = {"COIN": "NEB", "USERNAME": "neb1test", "POOL_URL": "stratum+ssl://neb.suprnova.cc:7806"}
+    neb_groups = [
+        {"name": "neb5090batch", "priority": "batch", "replicas": 10,
+         "current_state": {"status": "stopped", "instance_status_counts": {"running_count": 0}},
+         "container": {"image": "ocminersupr/suprminer-base:1.9.63", "resources": {"gpu_classes": ["g5090"]}, "environment_variables": neb_env}},
+    ]
+    c_neb_on, _, _ = plan_actions(neb_groups, gpu_classes, 0.06, 200.0, 15.0, 10.0, 2.0, neb_usd_per_gh_hr_gross=0.195)
+    assert c_neb_on[0]["action"] == "START", c_neb_on
+    neb_groups[0]["current_state"]["status"] = "running"
+    c_neb_off, _, _ = plan_actions(neb_groups, gpu_classes, 0.06, 200.0, 15.0, 10.0, 2.0, neb_usd_per_gh_hr_gross=0.095)
+    assert c_neb_off[0]["action"] == "STOP", c_neb_off
+    assert plan_rollout(neb_groups, "ghcr.io/nichesco/pearl:new") == []
+
     price, psrc = fetch_pearl_price_usd()
     net_h, rw, bt, nsrc = fetch_pearl_network()
     print(f"SELF-TEST PASSED | Live check: PEARL=${price:.4f} ({psrc}), net={net_h/1e18:.2f} EH/s ({nsrc})")
@@ -538,6 +617,14 @@ def main():
     groups = (http_json(f"{SALAD_API}/organizations/{org}/projects/{project}/containers", headers=headers) or {}).get("items", [])
     avail_by_group = fetch_gpu_availability(groups, api_key, org)
 
+    neb_usd_per_gh_hr_gross = None
+    if any(group_coin((g.get("container") or {}).get("environment_variables") or {}) == "NEB" for g in groups):
+        try:
+            neb_usd_per_gh_hr_gross, neb_price, neb_gh, neb_src = fetch_neb_usd_per_gh_hr_gross()
+            print(f"NEB Market  : NEB=${neb_price:.4f} (CoinGecko) | Net={neb_gh:.1f} GH/s ({neb_src}) | Gross=${neb_usd_per_gh_hr_gross:.4f}/hr per GH/s\n")
+        except Exception as e:
+            print(f"[warn] Failed to fetch NEB stats ({e}) — skipping NEB groups.\n")
+
     candidates, skipped, planned_daily = plan_actions(
         groups,
         gpu_classes,
@@ -549,6 +636,7 @@ def main():
         low_start_roi_pct=low_start_roi_pct,
         low_stop_roi_pct=low_stop_roi_pct,
         avail_by_group=avail_by_group,
+        neb_usd_per_gh_hr_gross=neb_usd_per_gh_hr_gross,
     )
 
     for name, reason in skipped:
@@ -576,7 +664,7 @@ def main():
         return
 
     for c in candidates:
-        if c["action"] in ("KEEP_RUNNING", "START"):
+        if c["action"] in ("KEEP_RUNNING", "START") and c["coin"] == "PRL":
             merged_env = dict(c["env"])
             changes = []
 
